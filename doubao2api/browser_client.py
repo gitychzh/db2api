@@ -112,6 +112,13 @@ class BrowserClient:
             "--no-sandbox",
         ]
 
+        # 可选代理：机房 IP 直连常被豆包风控要求滑轨验证，家用/住宅出口
+        # 一般不触发。形如 http://127.0.0.1:7895 或 socks5://host:port。
+        proxy = os.environ.get("DOUBAO_PROXY", "").strip() or None
+        if proxy:
+            log.info("Using proxy %s", proxy)
+        proxy_args = {"proxy": {"server": proxy}} if proxy else {}
+
         if self.user_data_dir:
             self._context = await self._playwright.chromium.launch_persistent_context(
                 self.user_data_dir,
@@ -119,6 +126,7 @@ class BrowserClient:
                 args=launch_args,
                 viewport={"width": 1280, "height": 720},
                 locale="zh-CN",
+                **proxy_args,
             )
             self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
         else:
@@ -127,6 +135,7 @@ class BrowserClient:
             )
             self._context = await browser.new_context(
                 viewport={"width": 1280, "height": 720}, locale="zh-CN",
+                **proxy_args,
             )
             self._page = await self._context.new_page()
 
