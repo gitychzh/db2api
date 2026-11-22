@@ -218,8 +218,9 @@ def parse_tool_calls_xml(text: str) -> Optional[list[dict[str, Any]]]:
     Returns list of OpenAI-format tool_call dicts, or None if not found.
     """
     tool_calls = []
-    
-    # Try official format first
+    positioned: list[tuple[int, dict[str, Any]]] = []
+
+    # 官方格式：<tool_call>...</tool_call>
     for m in _TOOL_CALL_RE.finditer(text):
         json_str = m.group(1).strip()
         try:
@@ -246,34 +247,50 @@ def parse_tool_calls_xml(text: str) -> Optional[list[dict[str, Any]]]:
         try:
             name = obj.get("name", "")
             arguments = _normalize_arg_keys(obj.get("arguments", {}))
-            tool_calls.append({
+            positioned.append((m.start(), {
                 "id": f"call_{uuid.uuid4().hex[:24]}",
                 "type": "function",
                 "function": {"name": name, "arguments": arguments},
-            })
+            }))
         except (AttributeError, TypeError) as e:
             log.warning("Failed to extract tool_call fields: %s", e)
             continue
-    
+
+    # 被切碎的开标签：模型把 "<tool_call>" 写成 "tool_call>" / "_call>" / "call>"
+    # （流式里第二个工具调用尤其常见）。把已识别的完整块屏蔽掉后，
+    # 在剩余文本里找紧跟 JSON 的残片，保证顺序与原输出一致。
+    masked = _TOOL_CALL_RE.sub(lambda m: " " * len(m.group(0)), text)
+    for m in _TOOL_CALL_JSON_RE.finditer(masked):
+        obj = _try_parse_json(m.group(1).strip())
+        if obj and isinstance(obj, dict) and "name" in obj and "arguments" in obj:
+            positioned.append((m.start(), {
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {
+                    "name": obj["name"],
+                    "arguments": _normalize_arg_keys(obj["arguments"]),
+                },
+            }))
+
+    if positioned:
+        positioned.sort(key=lambda item: item[0])
+        return [tc for _, tc in positioned]
+
+    # Fallback 2：有收标签但没开标签（思考模式）
+    for m in _TOOL_CALL_PARTIAL_RE.finditer(text):
+        json_str = m.group(1).strip()
+        obj = _try_parse_json(json_str)
+        if obj and isinstance(obj, dict) and "name" in obj:
+            arguments = _normalize_arg_keys(obj.get("arguments", {}))
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {"name": obj["name"], "arguments": arguments},
+            })
     if tool_calls:
         return tool_calls
-    
-    # Fallback 2: partial format (missing opening <tool_call> tag, common in thinking mode)
-    if "</tool_call>" in text:
-        for m in _TOOL_CALL_PARTIAL_RE.finditer(text):
-            json_str = m.group(1).strip()
-            obj = _try_parse_json(json_str)
-            if obj and isinstance(obj, dict) and "name" in obj:
-                arguments = _normalize_arg_keys(obj.get("arguments", {}))
-                tool_calls.append({
-                    "id": f"call_{uuid.uuid4().hex[:24]}",
-                    "type": "function",
-                    "function": {"name": obj["name"], "arguments": arguments},
-                })
-        if tool_calls:
-            return tool_calls
 
-    # Fallback 3: just find JSON with name+arguments pattern (no tags at all)
+    # Fallback 3: 裸 JSON（完全没有任何标签）
     if not tool_calls:
         for m in _TOOL_CALL_JSON_RE.finditer(text):
             json_str = m.group(1).strip()
@@ -313,16 +330,52 @@ def parse_tool_calls_xml(text: str) -> Optional[list[dict[str, Any]]]:
     return tool_calls if tool_calls else None
 
 
-def _strip_lead_noise(text: str) -> str:
-    """去掉模型在 <tool_call> 前塞的残渣（如 ">"、"> "、"："）。
+# 被切碎的开标签残片：流式下模型常把 "<tool_call>" 拆成 "tool_call>"、"_call>" 等，
+# 甚至整段丢掉 "<"。这些残片必须当作标签处理，否则会作为正文漏给客户端、
+# 并且让后面的 JSON 没法被识别成工具调用。
+_LEAD_FRAGMENTS = (
+    "tool_call>", "tool_calls>", "_call>", "call>",
+    "/tool_call>", "/tool_calls>", "tool_calls>>",
+)
 
-    第三方模型（DeepSeek 等）在带思考的流里常把开标签切碎，
-    内容起点会变成 ">\n{...}"，这里统一剥掉再判断。
+_TAG_PREFIXES = (
+    "<tool_call>", "<tool_calls>", "</tool_call>", "</tool_calls>",
+) + _LEAD_FRAGMENTS
+
+
+def _strip_lead_noise(text: str) -> str:
+    """去掉模型在工具调用前塞的残渣。
+
+    包括 ">"、"> "、"：" 这类标点，以及被切成残片的开标签
+    （"tool_call>"、"_call>" 等）。剥掉后剩下的部分才用来判断
+    “是不是工具调用的起点”。
     """
     s = text.lstrip()
-    while s[:1] and s[0] in ">：:":
-        s = s[1:].lstrip()
+    changed = True
+    while s and changed:
+        changed = False
+        if s[0] in ">：:":
+            s = s[1:].lstrip()
+            changed = True
+            continue
+        for frag in _LEAD_FRAGMENTS:
+            if s.startswith(frag):
+                s = s[len(frag):].lstrip()
+                changed = True
+                break
     return s
+
+
+def _looks_like_tag_prefix(text: str) -> bool:
+    """文本是否可能是（尚未接收完整的）工具调用标签。
+
+    流式缓冲用：遇到 "<tool_cal"、"tool_call"、"_cal" 这类前缀时不能当正文
+    立刻 flush，必须继续等后面的字节。
+    """
+    s = text.strip()
+    if not s:
+        return False
+    return any(frag.startswith(s) or s.startswith(frag) for frag in _TAG_PREFIXES)
 
 
 def is_tool_call_start(text: str) -> bool:
@@ -332,8 +385,12 @@ def is_tool_call_start(text: str) -> bool:
         return True
     if stripped.startswith("<tool_calls>"):
         return True
-    # 开标签被切碎的情况：只剩 ">" 之类，后面可能接 JSON，先当成潜在起点
+    # 开标签被切碎的情况：只剩 ">" / "tool_call>" 之类，后面可能接 JSON，先当成潜在起点
     if text.strip() and not stripped:
+        return True
+    # 残片后直接跟 JSON（"tool_call>{...}"）：剥掉残片后按裸 JSON 判断，已由上面覆盖；
+    # 若残片后还什么都没有，_looks_like_tag_prefix 会兜底
+    if _looks_like_tag_prefix(text):
         return True
     # Thinking mode: tool call may start with JSON directly (no opening tag)
     # Check if it looks like {"name": ...} or starts with { followed by "name"
@@ -345,6 +402,9 @@ def is_tool_call_start(text: str) -> bool:
 def has_complete_tool_calls(text: str) -> bool:
     """Check if text contains at least one complete tool_call block or parseable JSON."""
     if "</tool_call>" in text or "</tool_calls>" in text:
+        return True
+    # 开标签被切碎、只剩 JSON + 收标签的情况也视为完整（由 parse 的 partial 分支处理）
+    if "tool_call>" in text and text.strip().endswith("</tool_call>"):
         return True
     # In thinking mode, might just be bare JSON with name+arguments
     stripped = text.strip()
@@ -404,7 +464,7 @@ def _normalize_content(content: Any) -> str:
     return str(content)
 
 
-_DATA_URI_BLOB_RE = re.compile(r"data:[a-z]+/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]{200,}")
+_DATA_URI_BLOB_RE = re.compile(r"data:[a-z]+/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]{200,}={0,2}")
 
 
 def _scrub_data_uris(text: str) -> str:
