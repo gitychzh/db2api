@@ -1035,6 +1035,7 @@ server {
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `DOUBAO_PORT` | `9090` | 监听端口 |
+| `.env` | — | `python -m doubao2api` 启动时自动读取仓库根目录的 `.env`（已存在的环境变量优先） |
 | `DOUBAO_HOST` | `0.0.0.0` | 监听地址 |
 | `DOUBAO_API_KEY` | (空=无认证) | Bearer token。设为 `any` 接受任意非空 key |
 | `DOUBAO_RPM_LIMIT` | `20` | 每分钟请求限制（所有端点共享） |

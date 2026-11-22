@@ -2134,9 +2134,38 @@ def create_app(
 # ── Server runner ──
 
 
+def _load_dotenv() -> None:
+    """读取仓库根目录的 .env（存在时），不覆盖已有环境变量。
+
+    以前只有 deploy 脚本手动 export；用 `python -m doubao2api` 直接启动时
+    .env 根本没被读过，导致 DOUBAO_API_KEY / DOUBAO_HEADLESS 等静默失效
+    （网关无鉴权对外开放）。这里自己解析，不新增第三方依赖。
+    """
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, ".env")
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip()
+                if v and v[0] == v[-1] and v[0] in "\"'":
+                    v = v[1:-1]
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except OSError:
+        pass
+
+
 def run_server():
     """Start the uvicorn server with env-based configuration."""
     import uvicorn
+
+    _load_dotenv()
 
     host = os.environ.get("DOUBAO_HOST", "0.0.0.0")
     port = int(os.environ.get("DOUBAO_PORT", "9090"))

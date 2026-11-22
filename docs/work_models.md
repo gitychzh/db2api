@@ -79,3 +79,6 @@ curl -X POST http://127.0.0.1:9090/debug/raw_chat \
 网关会原样透传；未注册的 id 只要透传开着也能直接用。
 
 注意：`apiKey` 只写进客户端自己的配置，别提交到仓库。
+
+网关用 `python -m doubao2api` 启动时会自动读取仓库根目录的 `.env`（不覆盖已有环境变量），
+所以 `DOUBAO_API_KEY` / `DOUBAO_HEADLESS` 等写在那里即可；改完需要重启网关。
