@@ -208,33 +208,44 @@ class BrowserClient:
             "chat_input": await _count(self._CHAT_INPUT_SELECTOR),
         }
 
+    async def _has_session_cookie(self) -> bool:
+        """权威登录信号：豆包登录态在 sessionid cookie 里。
+
+        页面 UI 不可靠——未登录页同样有输入框，登录按钮有时也不在 DOM 里，
+        所以以 cookie 为准。
+        """
+        try:
+            cookies = await self._context.cookies("https://www.doubao.com")
+        except Exception as exc:
+            log.warning("读取 cookies 失败: %s", exc)
+            return False
+        return any(c.get("name") == "sessionid" and c.get("value") for c in cookies)
+
     async def _is_logged_out(self) -> bool:
+        if await self._has_session_cookie():
+            return False
         sig = await self._login_signals()
         return sig["login_button"] > 0 or sig["login_text"] > 0
 
     async def _check_login_state(self):
-        """Check if logged in; waits for the page to settle before deciding."""
+        """Check if logged in; cookie 为准，UI 只作日志。"""
+        has_cookie = False
         sig: Dict[str, int] = {}
-        # 首屏渲染有延迟：最多等 20 秒，直到出现可用输入框或明确的未登录信号
         for attempt in range(10):
+            has_cookie = await self._has_session_cookie()
             sig = await self._login_signals()
-            if sig["login_button"] or sig["login_text"] or sig["chat_input"]:
+            if has_cookie or sig["login_button"] or sig["login_text"]:
                 break
             await asyncio.sleep(2)
 
         log.info(
-            "Login check: login_button=%d login_text=%d chat_input=%d",
-            sig.get("login_button", 0), sig.get("login_text", 0), sig.get("chat_input", 0),
+            "Login check: sessionid=%s login_button=%d login_text=%d chat_input=%d",
+            has_cookie, sig.get("login_button", 0), sig.get("login_text", 0),
+            sig.get("chat_input", 0),
         )
 
-        if sig.get("login_button") or sig.get("login_text"):
-            log.info("Not logged in - login prompt visible")
-            self._ready = False
-            return
-
-        if not sig.get("chat_input"):
-            # 既没有登录提示也没有输入框：页面状态未知，不能当成已登录
-            log.warning("Login state unknown (no input box found) - marking not ready")
+        if not has_cookie:
+            log.info("Not logged in - no sessionid cookie")
             self._ready = False
             return
 

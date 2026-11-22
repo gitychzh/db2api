@@ -1979,6 +1979,20 @@ def create_app(
         except Exception as exc:
             log.error("QR login error: %s", exc)
 
+    @app.post("/auth/recheck")
+    async def auth_recheck(request: Request):
+        """重新检测登录态（cookie 为准），用于排查登录误判。"""
+        _check_auth(request)
+        client = _browser.get("client")
+        if client is None:
+            raise HTTPException(status_code=503, detail="Browser not initialized")
+        await client._check_login_state()
+        return {
+            "logged_in": client.is_ready,
+            "has_sessionid": await client._has_session_cookie(),
+            "page_url": client.page.url if client.page else "",
+        }
+
     @app.get("/auth/status")
     async def auth_status(request: Request):
         return await _get_login_status(request)
