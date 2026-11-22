@@ -15,6 +15,8 @@ and call this signing function. All actual API traffic goes through httpx.
 import asyncio
 import json
 import logging
+import os
+import re
 import time
 import uuid
 from typing import AsyncGenerator, Optional, Dict, Any, List
@@ -132,10 +134,21 @@ class BrowserClient:
         stealth = Stealth(navigator_languages_override=("zh-CN", "zh"))
         await stealth.apply_stealth_async(self._page)
 
+        # Seed cookies from DOUBAO_COOKIE (e.g. exported from the desktop
+        # client) before the first navigation.  The persistent profile may
+        # hold a stale sessionid; an explicit cookie string is authoritative.
+        await self._seed_cookies_from_env()
+
         # Navigate
         log.info("Navigating to %s", CHAT_URL)
         await self._page.goto(CHAT_URL, wait_until="load", timeout=60000)
         await asyncio.sleep(3)
+
+        # Re-apply the authoritative cookie set: the server issues fresh
+        # ttwid/s_v_web_id during navigation, and a sessionid paired with a
+        # mismatched device fingerprint trips upstream risk control
+        # (710022004).  Harmless when DOUBAO_COOKIE is unset.
+        await self._seed_cookies_from_env()
 
         # Init httpx
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(180, connect=10))
@@ -396,6 +409,44 @@ class BrowserClient:
         log.warning("No clickable login trigger found")
         return False
 
+
+    async def _seed_cookies_from_env(self) -> None:
+        """Inject cookies from ``DOUBAO_COOKIE`` into the browser context.
+
+        The env var uses the standard ``Cookie:`` header format.  Every
+        cookie is scoped to ``.doubao.com``.  Missing/blank env var is a
+        no-op, so profile-only deployments keep working.
+        """
+        raw = os.environ.get("DOUBAO_COOKIE", "").strip()
+        if not raw or not self._context:
+            return
+        try:
+            from .session import _parse_cookie_header
+
+            cookies = _parse_cookie_header(raw)
+            if not cookies:
+                return
+            # Clear same-named cookies already in the persistent profile,
+            # otherwise both copies are sent and the session/fingerprint
+            # pairing breaks (upstream answers 710022004).
+            try:
+                await self._context.clear_cookies(
+                    name=re.compile("|".join(re.escape(k) for k in cookies)),
+                )
+            except Exception as exc:
+                log.debug("clear_cookies before seeding failed: %s", exc)
+            pw_cookies = [
+                {"name": k, "value": v, "domain": ".doubao.com", "path": "/"}
+                for k, v in cookies.items()
+            ]
+            await self._context.add_cookies(pw_cookies)
+            log.info(
+                "Seeded %d cookies from DOUBAO_COOKIE (sessionid=%s)",
+                len(pw_cookies),
+                "present" if cookies.get("sessionid") else "MISSING",
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("Seeding cookies from DOUBAO_COOKIE failed: %s", exc)
 
     async def inject_cookies_and_reload(self, cookies: Dict[str, str]) -> bool:
         """Inject cookies from QR login into browser context and reload.
