@@ -337,15 +337,20 @@ class BrowserClient:
         log.warning("Fetch hook NOT detected after 30s - requests may fail")
         return False
 
-    async def wait_for_login(self, timeout: int = 120) -> bool:
+    async def wait_for_login(self, timeout: int = 300) -> bool:
         """Wait for user to scan QR code via noVNC."""
         await self._trigger_login_dialog()
         log.info("Waiting for QR scan login (timeout=%ds)...", timeout)
         try:
-            login_btn = self._page.locator(self._LOGIN_BUTTON_SELECTOR)
-            await login_btn.wait_for(state="hidden", timeout=timeout * 1000)
+            # 以 sessionid cookie 出现为准，不依赖按钮是否从 DOM 消失
+            deadline = timeout
+            while deadline > 0:
+                if await self._has_session_cookie():
+                    break
+                await asyncio.sleep(2)
+                deadline -= 2
             await asyncio.sleep(2)
-            if not await self._is_logged_out():
+            if await self._has_session_cookie():
                 self._ready = True
                 await self._extract_params()
                 await self._seed_ms_token()
@@ -359,12 +364,37 @@ class BrowserClient:
             log.error("Login timeout: %s", e)
             return False
 
-    async def _trigger_login_dialog(self):
-        """Click login button to show QR code."""
-        btn = self._page.locator(self._LOGIN_BUTTON_SELECTOR)
-        if await btn.count() > 0:
-            await btn.click()
-            await asyncio.sleep(2)
+    async def _trigger_login_dialog(self) -> bool:
+        """Open the login/QR dialog.
+
+        豆包的登录入口不一定是 <button>，也可能在 shadow/div 里，
+        因此按优先级尝试多个定位器，命中即点。
+        """
+        selectors = [
+            self._LOGIN_BUTTON_SELECTOR,
+            'button:has-text("立即登录")',
+            '[class*="login"]:has-text("登录")',
+            'div:has-text("请先登录")',
+            'text=登录',
+        ]
+        for sel in selectors:
+            try:
+                loc = self._page.locator(sel)
+                n = await loc.count()
+                if n == 0:
+                    continue
+                # 取最后一个可见元素（顶部按钮通常在最后）
+                for i in range(n - 1, -1, -1):
+                    item = loc.nth(i)
+                    if await item.is_visible():
+                        await item.click(timeout=5000)
+                        log.info("Clicked login trigger: %s (index %d/%d)", sel, i, n)
+                        await asyncio.sleep(2)
+                        return True
+            except Exception as exc:
+                log.debug("login trigger %s failed: %s", sel, exc)
+        log.warning("No clickable login trigger found")
+        return False
 
 
     async def inject_cookies_and_reload(self, cookies: Dict[str, str]) -> bool:

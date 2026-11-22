@@ -1971,7 +1971,7 @@ def create_app(
     async def _do_login(client: BrowserClient):
         """Background login task."""
         try:
-            ok = await client.wait_for_login(timeout=120)
+            ok = await client.wait_for_login(timeout=600)
             if ok:
                 log.info("QR login successful via /auth")
             else:
