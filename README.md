@@ -79,7 +79,18 @@
 - **多媒体生成**：免费生成图片（文生图、图生图）、音乐、视频，Agent 的输出不再局限于文字
 - **文件中转站**（奇淫技巧）：通过 `/v1/files` 可上传任意文件（最大 1GB）获得一个永久 TOS URI，之后随时凭这个 URI 调用 `/v1/files/download` 换取 7 天有效的下载链接，过期了再换一个就行。这意味着你可以把它当作**免费的跨机器文件传输通道**——Agent A 在服务器 A 上传文件拿到 URI，把 URI 传给 Agent B，Agent B 在另一台服务器上凭 URI 获取下载链接直接拉取文件。无需自建 OSS，无需打通内网，单文件最大 1GB，存储不过期。有兴趣的兄弟可以基于这个开做个文件中转，感觉会很不错
 
-⚠️ **不适合编程智能体**：豆包客户端模型**不支持 Function Calling / Tool Use**（无法调用外部工具如文件读写、终端命令、代码搜索等），因此**不适合**作为编程智能体（Claude Code、Codex、OpenCode 等）的后端模型。如果你需要的是能操作代码仓库的 coding agent，请选择原生支持工具调用的模型 API。
+### 给编程智能体用（opencode / Claude Code 等）
+
+豆包客户端协议本身**没有原生 Function Calling**，但本网关在提示词层做了工具协议注入：
+把 OpenAI `tools` 渲染成文本协议、解析模型回出的 `<tool_call>` 块，再还原成标准
+`tool_calls`（含流式增量、并行调用、思考与工具共存）。因此可以当 opencode 等
+编程智能体的后端，实测多轮 `bash`/`read`/`edit` 往返正常。
+
+- 工具调用走「专家模式」通道（`doubao-expert`，`need_deep_think=3`），思考链与工具调用可同时成立。
+- 「工作」页签的第三方模型（DeepSeek / GLM / Qwen 等）用 `model_item_key` 选择，
+  详见 [`docs/work_models.md`](docs/work_models.md)。
+- 局限：工具调用是提示词模拟，不是服务端原生协议，可靠性低于原生 tool-use 模型；
+  超长工具结果会被截断/降级（base64 图片与文件一律换成占位符），且上下文受豆包侧限制。
 
 ## 原理
 

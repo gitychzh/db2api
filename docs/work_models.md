@@ -53,3 +53,29 @@ curl -X POST http://127.0.0.1:9090/debug/raw_chat \
 
 - `model_echo` 里出现你传的 key：选中成功
 - `model_echo` 为空或出现豆包默认模型：key 不对，服务端回落了默认模型
+
+## 4. 客户端接入（opencode）
+
+同一台机器：
+
+```json
+{
+  "provider": {
+    "db2api": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Doubao2API",
+      "options": {"baseURL": "http://127.0.0.1:9090/v1", "apiKey": "<DOUBAO_API_KEY>"},
+      "models": {
+        "deepseek-v4.1-flash": {"name": "DeepSeek V4.1 Flash (豆包工作)"},
+        "doubao-think": {"name": "Doubao 思考"}
+      }
+    }
+  }
+}
+```
+
+跨机器（网关在另一台机上）时把 `baseURL` 换成本机可达的地址，并确认网关监听
+`DOUBAO_HOST=0.0.0.0`（默认值）。`model` 字段就是上文的别名或 `model_item_key`，
+网关会原样透传；未注册的 id 只要透传开着也能直接用。
+
+注意：`apiKey` 只写进客户端自己的配置，别提交到仓库。
