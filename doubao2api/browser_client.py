@@ -32,6 +32,18 @@ DOUBAO_URL = "https://www.doubao.com"
 CHAT_URL = f"{DOUBAO_URL}/chat/"
 COMPLETION_URL = f"{DOUBAO_URL}/chat/completion"
 SAMANTHA_COMPLETION_URL = f"{DOUBAO_URL}/samantha/chat/completion"
+
+# ── 桌面客户端身份常量（CDP 抓包自 Doubao v2.36.14 / Chromium 147）──────────
+CLIENT_AID = "582478"          # 客户端用 582478；网页版是 497858
+CLIENT_CHANNEL = "win"
+CLIENT_VERSION = "2.36.14"
+CLIENT_CHROMIUM = "147.0.7727.149"
+CLIENT_RUNTIME = "3.46.9"
+CLIENT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/147.0.7727.149 Safari/537.36 "
+    "SamanthaDoubao/2.36.14"
+)
 DEFAULT_BOT_ID = "7338286299411103781"
 
 
@@ -556,28 +568,49 @@ class BrowserClient:
         raise RuntimeError(f"Failed to generate X-Bogus signature: {last_error}")
 
     def _build_query_params(self) -> Dict[str, str]:
-        """Build the standard query parameters for API calls."""
+        """Build query parameters matching the *desktop client*.
+
+        实测（CDP 抓 Win10 客户端 v2.36.14）：聊天请求带 ``channel=win`` /
+        ``client_platform=pc_client`` / ``doubao_device_platform=desktop``，
+        且 ``fp=verify_<device_id>`` 而不是浏览器指纹。伪装成网页版会让风控
+        把我们当成异常会话（710022004）。``DOUBAO_CLIENT_MODE=web`` 可退回旧行为。
+        """
         params = {
-            "aid": "497858",
+            "aid": CLIENT_AID,
+            "channel": CLIENT_CHANNEL,
+            "chromium_version": CLIENT_CHROMIUM,
+            "client_platform": "pc_client",
             "device_id": self._device_id or "",
             "device_platform": "web",
-            "fp": self._fp or "",
+            "doubao_device_platform": "desktop",
+            "doubao_pc_version": CLIENT_VERSION,
+            "fp": self._client_fp,
             "language": "zh",
-            "pc_version": "3.19.4",
+            "pc_version": CLIENT_VERSION,
             "pkg_type": "release_version",
-            "real_aid": "497858",
-            "region": "",
+            "real_aid": CLIENT_AID,
+            "region": "CN",
+            "runtime": "web",
+            "runtime_version": CLIENT_RUNTIME,
             "samantha_web": "1",
-            "sys_region": "",
-            "tea_uuid": self._web_id or "",
+            "sys_region": "CN",
+            "tea_uuid": self._device_id or "",
+            "tz_name": "Asia/Shanghai",
             "use-olympus-account": "1",
             "version_code": "20800",
             "web_id": self._web_id or "",
-            "web_tab_id": str(uuid.uuid4()),
         }
         if self._ms_token:
             params["msToken"] = self._ms_token
         return params
+
+    @property
+    def _client_fp(self) -> str:
+        """桌面客户端的 fp 形如 ``verify_<device_id>``；网页版才是 verify_xxx_yyy。"""
+        if os.environ.get("DOUBAO_CLIENT_MODE", "desktop").lower() == "web":
+            return self._fp or ""
+        did = self._device_id or ""
+        return f"verify_{did}" if did else (self._fp or "")
 
     def _build_headers(self, cookie_str: str, csrf_token: str = "") -> Dict[str, str]:
         """Build request headers."""
@@ -595,8 +628,9 @@ class BrowserClient:
             "Origin": DOUBAO_URL,
             "Referer": CHAT_URL,
             "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                CLIENT_UA if os.environ.get("DOUBAO_CLIENT_MODE", "desktop").lower() != "web"
+                else "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
             ),
             "agw-js-conv": "str, str",
         }
@@ -663,6 +697,7 @@ class BrowserClient:
                 "collect_id": "",
                 "is_audio": False,
                 "answer_with_suggest": False,
+                "agent_mode": 2,
                 "tts_switch": False,
                 "need_deep_think": use_deep_think,
                 "click_clear_context": False,
@@ -691,10 +726,33 @@ class BrowserClient:
                     "append_sse_event_scene": 0,
                 },
                 "message_storage_type": 0,
+                # 客户端固定带上；缺它服务端会走另一条（网页）分支
+                "general_task_param": {
+                    "runtime_type": 0,
+                    "agent_task_param": {},
+                    "project_id": "",
+                    "server_do_compare": True,
+                },
+                "model_config": {
+                    "model_item_key": "0",
+                    "model_extra_params": {},
+                    "reasoning_effort": 5,
+                },
+                "aggregate_params": {
+                    "mention_skill_list": "[]",
+                    "mention_plugin_list": "[]",
+                    "mention_ext": "[{}]",
+                    "conversation_mode": "",
+                    "mode_id": "1",
+                    "model_item_key": "0",
+                    "agent_mode": "2",
+                    "reasoning_effort": "5",
+                    "provider_id": "",
+                },
             },
             "ext": {
                 "use_deep_think": str(use_deep_think),
-                "fp": self._fp or "",
+                "fp": self._client_fp,
                 "collection_id": "",
                 "commerce_credit_config_enable": "0",
                 "sub_conv_firstmet_type": "1" if need_create else "0",
