@@ -350,7 +350,12 @@ def create_app(
     _qianwen: Dict[str, Any] = {}  # holds QianwenClient instance
 
     async def _browser_watchdog():
-        """Background task: check browser health every 30s, auto-restart on crash."""
+        """Background task: check browser health every 30s, auto-restart on crash.
+
+        连续 3 次心跳失败才重启。单次失败可能只是页面在跑长任务、或机房/
+        代理出口抖动；立刻重启会把正在进行的对话打断，形成重启死循环。
+        """
+        strikes = 0
         while True:
             await asyncio.sleep(30)
             client = _browser.get("client")
@@ -358,13 +363,20 @@ def create_app(
                 continue
             try:
                 alive = await client.is_alive()
-                if not alive:
-                    log.error("Browser watchdog: process dead, restarting...")
-                    await client.restart()
-                    if client.is_ready:
-                        log.info("Browser watchdog: restart successful")
-                    else:
-                        log.warning("Browser watchdog: restarted but not logged in")
+                if alive:
+                    strikes = 0
+                    continue
+                strikes += 1
+                log.warning("Browser watchdog: health check failed (%d/3)", strikes)
+                if strikes < 3:
+                    continue
+                strikes = 0
+                log.error("Browser watchdog: process dead, restarting...")
+                await client.restart()
+                if client.is_ready:
+                    log.info("Browser watchdog: restart successful")
+                else:
+                    log.warning("Browser watchdog: restarted but not logged in")
             except Exception as e:
                 log.error("Browser watchdog error: %s", e)
 

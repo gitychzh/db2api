@@ -186,12 +186,16 @@ class BrowserClient:
         log.info("BrowserClient stopped")
 
     async def is_alive(self) -> bool:
-        """Check if browser process is still responsive."""
+        """Check if browser process is still responsive.
+
+        用 ``about:blank`` 上的极简求值做心跳：不触网，因此不会因为机房/代理
+        出口的 RTT 抖动被误判成“进程已死”（曾导致 watchdog 每 30s 重启死循环）。
+        """
         if not self._page or not self._context:
             return False
         try:
             result = await asyncio.wait_for(
-                self._page.evaluate("1+1"), timeout=5
+                self._page.evaluate("() => 1 + 1"), timeout=15
             )
             return result == 2
         except Exception as e:
