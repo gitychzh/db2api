@@ -98,19 +98,6 @@ def test_scrub_data_uris():
     assert "before" in out and "after" in out
 
 
-if __name__ == "__main__":
-    failed = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"PASS {name}")
-            except AssertionError as exc:
-                failed += 1
-                print(f"FAIL {name}: {exc}")
-    sys.exit(1 if failed else 0)
-
-
 def test_builtin_models_never_passthrough():
     """内置会话模型 / Qianwen 模型不能掉进工作模型透传。
 
@@ -124,3 +111,16 @@ def test_builtin_models_never_passthrough():
     assert us.resolve_work_spec("deepseek-v4.1-flash") is not None
     assert us.resolve_work_spec("person-some-model-261017") is not None
     assert us.resolve_work_spec("work:person-x")["model_item_key"] == "person-x"
+
+
+if __name__ == "__main__":
+    failed = 0
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            try:
+                fn()
+                print(f"PASS {name}")
+            except AssertionError as exc:
+                failed += 1
+                print(f"FAIL {name}: {exc}")
+    sys.exit(1 if failed else 0)
