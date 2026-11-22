@@ -188,14 +188,53 @@ class BrowserClient:
     # Login
     # ------------------------------------------------------------------
 
-    async def _check_login_state(self):
-        """Check if logged in by looking for login button."""
-        login_btn = self._page.locator('button:has-text("登录")')
-        btn_count = await login_btn.count()
-        log.info("Login check: login_button_count=%d", btn_count)
+    # 登录态判定用多个信号，避免页面尚未渲染就误判成"已登录"：
+    #   未登录：右上角"登录"按钮 / 页面上的 "Please log in" 文案
+    #   已登录：聊天输入框（textarea 或 contenteditable）存在
+    _LOGIN_BUTTON_SELECTOR = 'button:has-text("登录")'
+    _LOGIN_TEXT_SELECTOR = 'text=Please log in'
+    _CHAT_INPUT_SELECTOR = 'textarea, [contenteditable="true"]'
 
-        if btn_count > 0:
-            log.info("Not logged in - login button visible")
+    async def _login_signals(self) -> Dict[str, int]:
+        async def _count(selector: str) -> int:
+            try:
+                return await self._page.locator(selector).count()
+            except Exception:
+                return 0
+
+        return {
+            "login_button": await _count(self._LOGIN_BUTTON_SELECTOR),
+            "login_text": await _count(self._LOGIN_TEXT_SELECTOR),
+            "chat_input": await _count(self._CHAT_INPUT_SELECTOR),
+        }
+
+    async def _is_logged_out(self) -> bool:
+        sig = await self._login_signals()
+        return sig["login_button"] > 0 or sig["login_text"] > 0
+
+    async def _check_login_state(self):
+        """Check if logged in; waits for the page to settle before deciding."""
+        sig: Dict[str, int] = {}
+        # 首屏渲染有延迟：最多等 20 秒，直到出现可用输入框或明确的未登录信号
+        for attempt in range(10):
+            sig = await self._login_signals()
+            if sig["login_button"] or sig["login_text"] or sig["chat_input"]:
+                break
+            await asyncio.sleep(2)
+
+        log.info(
+            "Login check: login_button=%d login_text=%d chat_input=%d",
+            sig.get("login_button", 0), sig.get("login_text", 0), sig.get("chat_input", 0),
+        )
+
+        if sig.get("login_button") or sig.get("login_text"):
+            log.info("Not logged in - login prompt visible")
+            self._ready = False
+            return
+
+        if not sig.get("chat_input"):
+            # 既没有登录提示也没有输入框：页面状态未知，不能当成已登录
+            log.warning("Login state unknown (no input box found) - marking not ready")
             self._ready = False
             return
 
@@ -292,10 +331,10 @@ class BrowserClient:
         await self._trigger_login_dialog()
         log.info("Waiting for QR scan login (timeout=%ds)...", timeout)
         try:
-            login_btn = self._page.locator('button:has-text("登录")')
+            login_btn = self._page.locator(self._LOGIN_BUTTON_SELECTOR)
             await login_btn.wait_for(state="hidden", timeout=timeout * 1000)
             await asyncio.sleep(2)
-            if await login_btn.count() == 0:
+            if not await self._is_logged_out():
                 self._ready = True
                 await self._extract_params()
                 await self._seed_ms_token()
@@ -311,7 +350,7 @@ class BrowserClient:
 
     async def _trigger_login_dialog(self):
         """Click login button to show QR code."""
-        btn = self._page.locator('button:has-text("登录")')
+        btn = self._page.locator(self._LOGIN_BUTTON_SELECTOR)
         if await btn.count() > 0:
             await btn.click()
             await asyncio.sleep(2)

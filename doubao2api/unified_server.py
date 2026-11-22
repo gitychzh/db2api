@@ -1943,6 +1943,12 @@ def create_app(
         client = _browser.get("client")
         if client is None:
             raise HTTPException(status_code=503, detail="Browser not initialized")
+        # 重新检测一次，避免启动时的误判让登录入口被短路
+        if client.is_ready:
+            try:
+                await client._check_login_state()
+            except Exception as exc:
+                log.warning("Login re-check failed: %s", exc)
         if client.is_ready:
             return {"status": "already_logged_in"}
 
