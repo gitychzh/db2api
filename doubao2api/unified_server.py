@@ -144,6 +144,10 @@ def resolve_work_spec(name: str) -> Optional[Dict[str, Any]]:
       person-xxx   直接就是豆包市场的 model_item_key
       work:xxx     去掉 "work:" 前缀后作为 model_item_key
       其它任意 id  同样原样作为 model_item_key（可用 DOUBAO_WORK_PASSTHROUGH=0 关闭）
+
+    注意：豆包自有的会话模型（doubao / doubao-think / doubao-expert 等）和
+    Qianwen 模型必须走各自的原生通道，绝不能掉进工作模型透传，否则会被
+    当成 model_item_key 发给服务端（登录态/风控与参数全错）。
     """
     if name in WORK_MODELS:
         return dict(WORK_MODELS[name])
@@ -151,6 +155,8 @@ def resolve_work_spec(name: str) -> Optional[Dict[str, Any]]:
         spec = dict(WORK_MODEL_DEFAULTS)
         spec.update(WORK_REGISTRY[name])
         return spec
+    if name in CHAT_MODELS or name in QIANWEN_MODEL_NAMES:
+        return None
     if not _passthrough_enabled():
         return None
     key = name[5:] if name.startswith("work:") else name

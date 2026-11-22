@@ -109,3 +109,18 @@ if __name__ == "__main__":
                 failed += 1
                 print(f"FAIL {name}: {exc}")
     sys.exit(1 if failed else 0)
+
+
+def test_builtin_models_never_passthrough():
+    """内置会话模型 / Qianwen 模型不能掉进工作模型透传。
+
+    回归：透传默认开启时，resolve_work_spec("doubao") 曾返回工作模型 spec，
+    导致普通对话被当成 model_item_key=doubao 发给服务端。
+    """
+    import doubao2api.unified_server as us
+
+    for name in ("doubao", "doubao-pro", "doubao-think", "doubao-expert"):
+        assert us.resolve_work_spec(name) is None, name
+    assert us.resolve_work_spec("deepseek-v4.1-flash") is not None
+    assert us.resolve_work_spec("person-some-model-261017") is not None
+    assert us.resolve_work_spec("work:person-x")["model_item_key"] == "person-x"
