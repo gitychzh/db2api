@@ -191,6 +191,23 @@ def _try_parse_json(json_str: str) -> Optional[dict]:
         return None
 
 
+def _normalize_arg_keys(arguments: Any) -> str:
+    """把工具参数序列化成 JSON，并清掉模型误加的标记。
+
+    提示词里用 `!`/`?` 标记必填/可选，部分模型会把标记一起写进键名
+    （如 "command!": "ls"），这里统一剥离，避免 schema 校验失败。
+    """
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except (json.JSONDecodeError, TypeError):
+            return arguments
+    if isinstance(arguments, dict):
+        cleaned = {str(k).rstrip("!?*").strip(): v for k, v in arguments.items()}
+        return json.dumps(cleaned, ensure_ascii=False)
+    return json.dumps(arguments, ensure_ascii=False)
+
+
 def parse_tool_calls_xml(text: str) -> Optional[list[dict[str, Any]]]:
     """Parse tool_call blocks from model output.
     
@@ -228,11 +245,7 @@ def parse_tool_calls_xml(text: str) -> Optional[list[dict[str, Any]]]:
                 continue
         try:
             name = obj.get("name", "")
-            arguments = obj.get("arguments", {})
-            if isinstance(arguments, dict):
-                arguments = json.dumps(arguments, ensure_ascii=False)
-            elif not isinstance(arguments, str):
-                arguments = json.dumps(arguments, ensure_ascii=False)
+            arguments = _normalize_arg_keys(obj.get("arguments", {}))
             tool_calls.append({
                 "id": f"call_{uuid.uuid4().hex[:24]}",
                 "type": "function",
@@ -251,11 +264,7 @@ def parse_tool_calls_xml(text: str) -> Optional[list[dict[str, Any]]]:
             json_str = m.group(1).strip()
             obj = _try_parse_json(json_str)
             if obj and isinstance(obj, dict) and "name" in obj:
-                arguments = obj.get("arguments", {})
-                if isinstance(arguments, dict):
-                    arguments = json.dumps(arguments, ensure_ascii=False)
-                elif not isinstance(arguments, str):
-                    arguments = json.dumps(arguments, ensure_ascii=False)
+                arguments = _normalize_arg_keys(obj.get("arguments", {}))
                 tool_calls.append({
                     "id": f"call_{uuid.uuid4().hex[:24]}",
                     "type": "function",
@@ -270,11 +279,7 @@ def parse_tool_calls_xml(text: str) -> Optional[list[dict[str, Any]]]:
             json_str = m.group(1).strip()
             obj = _try_parse_json(json_str)
             if obj and isinstance(obj, dict) and "name" in obj and "arguments" in obj:
-                arguments = obj.get("arguments", {})
-                if isinstance(arguments, dict):
-                    arguments = json.dumps(arguments, ensure_ascii=False)
-                elif not isinstance(arguments, str):
-                    arguments = json.dumps(arguments, ensure_ascii=False)
+                arguments = _normalize_arg_keys(obj.get("arguments", {}))
                 tool_calls.append({
                     "id": f"call_{uuid.uuid4().hex[:24]}",
                     "type": "function",
@@ -308,12 +313,27 @@ def parse_tool_calls_xml(text: str) -> Optional[list[dict[str, Any]]]:
     return tool_calls if tool_calls else None
 
 
+def _strip_lead_noise(text: str) -> str:
+    """去掉模型在 <tool_call> 前塞的残渣（如 ">"、"> "、"："）。
+
+    第三方模型（DeepSeek 等）在带思考的流里常把开标签切碎，
+    内容起点会变成 ">\n{...}"，这里统一剥掉再判断。
+    """
+    s = text.lstrip()
+    while s[:1] and s[0] in ">：:":
+        s = s[1:].lstrip()
+    return s
+
+
 def is_tool_call_start(text: str) -> bool:
     """Check if accumulated text looks like the start of a tool call."""
-    stripped = text.strip()
+    stripped = _strip_lead_noise(text)
     if stripped.startswith("<tool_call>") or stripped.startswith("<tool_call\n"):
         return True
     if stripped.startswith("<tool_calls>"):
+        return True
+    # 开标签被切碎的情况：只剩 ">" 之类，后面可能接 JSON，先当成潜在起点
+    if text.strip() and not stripped:
         return True
     # Thinking mode: tool call may start with JSON directly (no opening tag)
     # Check if it looks like {"name": ...} or starts with { followed by "name"
@@ -356,6 +376,44 @@ def _truncate_tool_result(content: str, max_chars: int = MAX_TOOL_RESULT_CHARS) 
             content[-half:])
 
 
+def _normalize_content(content: Any) -> str:
+    """把 OpenAI 的多段 content 压成纯文本。
+
+    客户端（opencode 等）的 tool 结果常常是 parts 列表，里面可能夹带
+    图片/文件（几十万字符的 base64）。本模型没有视觉能力，这些 data URI
+    只会把请求体撑爆并让服务端直接拒收，所以这里一律降级成占位符。
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for p in content:
+            if isinstance(p, dict):
+                ptype = p.get("type")
+                if ptype == "text" and p.get("text"):
+                    out.append(str(p["text"]))
+                elif ptype in ("image_url", "image"):
+                    out.append("[image omitted: 该模型不支持图片输入]")
+                elif ptype == "file":
+                    out.append("[attachment omitted: 该模型不支持文件输入]")
+            elif isinstance(p, str):
+                out.append(p)
+        return "\n".join(out)
+    if content is None:
+        return ""
+    return str(content)
+
+
+_DATA_URI_BLOB_RE = re.compile(r"data:[a-z]+/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]{200,}")
+
+
+def _scrub_data_uris(text: str) -> str:
+    """兜底：把残留的大段 base64 data URI 换成占位符。"""
+    if "base64," not in text:
+        return text
+    return _DATA_URI_BLOB_RE.sub("[data URI omitted]", text)
+
+
 def convert_messages_with_tools(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]],
@@ -385,7 +443,7 @@ def convert_messages_with_tools(
         
         elif role == "tool":
             name = msg.get("name", "unknown_tool")
-            tool_content = _truncate_tool_result(content or "")
+            tool_content = _truncate_tool_result(_normalize_content(content))
             parts.append(TOOL_RESULT_TEMPLATE.format(
                 name=name, content=tool_content
             ))
@@ -396,16 +454,10 @@ def convert_messages_with_tools(
                 xml = _reconstruct_tool_calls_xml(tool_calls)
                 parts.append(f"[assistant]: {xml}")
             elif content:
-                parts.append(f"[assistant]: {content}")
+                parts.append(f"[assistant]: {_normalize_content(content)}")
         
         elif role == "user":
-            text = ""
-            if isinstance(content, str):
-                text = content
-            elif isinstance(content, list):
-                text_parts = [p.get("text", "") for p in content 
-                             if isinstance(p, dict) and p.get("type") == "text"]
-                text = "".join(text_parts)
+            text = _normalize_content(content)
             if text:
                 if first_user_msg is None:
                     first_user_msg = text
@@ -427,12 +479,15 @@ def convert_messages_with_tools(
     parts = offload_long_messages(parts)
     
     result = "\n\n".join(parts)
-    
+
+    # 兜底：清掉任何残留的超长 base64 data URI（否则请求体会被服务端拒收）
+    result = _scrub_data_uris(result)
+
     # If still over limit after per-result truncation, drop oldest tool rounds
     if len(result) > max_chars:
         result = _drop_old_rounds(parts, max_chars, first_user_msg)
-    
-    return result
+
+    return _scrub_data_uris(result)
 
 
 def _drop_old_rounds(parts: list[str], max_chars: int, first_user_msg: Optional[str] = None) -> str:

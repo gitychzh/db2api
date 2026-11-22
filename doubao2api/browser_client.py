@@ -470,8 +470,16 @@ class BrowserClient:
         conversation_id: Optional[str] = None,
         bot_id: Optional[str] = None,
         use_deep_think: int = 0,
+        model_spec: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Send a chat message and yield SSE events via in-browser fetch."""
+        """Send a chat message and yield SSE events via in-browser fetch.
+
+        model_spec: 豆包工作（Work）模型市场选择，形如
+        {"model_item_key": "person-deepseek-v4-1-flash-261017",
+         "reasoning_effort": 5, "mode_id": "3", ...}。
+        置位时请求改走 agent 任务通道（agent_mode=1 / need_deep_think=10001 /
+        model_config），响应 SSE 格式与普通对话一致。
+        """
         if not self._ready:
             raise RuntimeError("Browser not ready - need login first")
 
@@ -549,60 +557,210 @@ class BrowserClient:
             },
         }
 
+        # ── Work-market model selection (豆包工作 模型市场) ──
+        # 选中第三方模型（如 DeepSeek V4.1 Flash）时，前端会附带 agent 任务参数，
+        # 缺任何一个服务端都会忽略 model_config 或直接回落默认模型。
+        if model_spec:
+            key = model_spec["model_item_key"]
+            effort = int(model_spec.get("reasoning_effort", 5))
+            mode_id = str(model_spec.get("mode_id", "3"))
+            # variant 用来标定“模型选择所需的最小字段集”：
+            #   agent  —— 与网页“工作”页签一致（agent_mode=1 + 任务参数 + 10001）
+            #   mid1   —— 保留 10001/mode 通道，但去掉 agent_mode 与任务参数
+            #   mid2   —— 保留 agent_mode，但去掉任务参数
+            #   mid3   —— 去掉 agent_mode，保留任务参数
+            #   plain  —— 完全走普通对话通道，只带 model_config
+            variant = str(model_spec.get("variant", "mid3"))
+            vdef = {
+                "agent": dict(agent_mode=True, init_option=True, task_param=True,
+                              conv_mode="2", deep=10001),
+                "mid1": dict(agent_mode=False, init_option=False, task_param=False,
+                             conv_mode="2", deep=10001),
+                "mid2": dict(agent_mode=True, init_option=False, task_param=False,
+                             conv_mode="2", deep=10001),
+                "mid3": dict(agent_mode=False, init_option=True, task_param=True,
+                             conv_mode="2", deep=10001),
+                "plain": dict(agent_mode=False, init_option=False, task_param=False,
+                              conv_mode="1", deep=0),
+            }.get(variant, None)
+            if vdef is None:
+                vdef = dict(agent_mode=True, init_option=True, task_param=True,
+                            conv_mode="2", deep=10001)
+            flags = dict(vdef)
+            # 允许从 model_spec 逐项覆盖，便于诊断端点做组合实验
+            for k_src, k_dst in (
+                ("agent_mode_flag", "agent_mode"),
+                ("init_option_flag", "init_option"),
+                ("task_param_flag", "task_param"),
+                ("conversation_mode", "conv_mode"),
+                ("need_deep_think", "deep"),
+            ):
+                if k_src in model_spec:
+                    flags[k_dst] = model_spec[k_src]
+            agent_mode_on = bool(flags["agent_mode"])
+            deep = int(flags["deep"])
+
+            task_param = {
+                "runtime_type": 1, "folder_name": "", "device_name": "",
+                "workspace": "", "local_app_id": "", "local_device_id": "",
+            }
+            init_option = {"project_id": "", "need_ack_conversation": True}
+            general_task_param = {
+                "action": 0,
+                "thread_local_message_id": [msg_uuid],
+                "project_id": "",
+                "runtime_type": 1,
+                "agent_task_param": dict(task_param),
+                "server_do_compare": True,
+            }
+            opt = payload["option"]
+            ext = payload["ext"]
+            # 是否让服务端下发 compact CHUNK_DELTA：紧凑 delta 不带 block 类型，
+            # 会把思考文本和正文混在一条流里；工作模型要分离 reasoning 时必须关掉。
+            opt["sse_recv_event_options"] = {
+                "support_chunk_delta": bool(model_spec.get("chunk_delta", True))
+            }
+
+            # 两种通道都带模型选择字段，保证服务端认出第三方模型
+            opt["model_config"] = {
+                "model_item_key": key,
+                "model_extra_params": {
+                    "memory_profile": model_spec.get("memory_profile", "300k_230"),
+                    "total_window_size": model_spec.get("total_window_size", "300000"),
+                },
+                "reasoning_effort": effort,
+            }
+            conv_init_ext = {
+                "model_item_key": key,
+                "reasoning_effort": str(effort),
+                "mode_id": mode_id,
+            }
+            if flags["task_param"]:
+                conv_init_ext["agent_task_param"] = json.dumps(task_param)
+            opt["conversation_init_ext"] = conv_init_ext
+            opt["aggregate_params"] = {
+                "mention_skill_list": "[]",
+                "mention_plugin_list": "[]",
+                "mention_ext": "[{}]",
+                "conversation_mode": str(flags["conv_mode"]),
+                "mode_id": mode_id,
+                "model_item_key": key,
+                "agent_mode": "1" if agent_mode_on else "0",
+                "reasoning_effort": str(effort),
+                "provider_id": "",
+            }
+
+            if agent_mode_on:
+                opt["agent_mode"] = 1
+            opt["need_deep_think"] = deep
+            if str(flags["conv_mode"]) == "2":
+                opt["conversation_mode"] = 2
+            if flags["init_option"]:
+                opt["conversation_init_option"] = dict(init_option)
+            if flags["task_param"]:
+                opt["general_task_param"] = general_task_param
+
+            ext["use_deep_think"] = str(deep)
+            ext["sub_conv_firstmet_type"] = "1"
+            ext["conversation_init_ext"] = json.dumps(conv_init_ext)
+            if agent_mode_on:
+                ext["agent_mode"] = "1"
+            if flags["init_option"]:
+                ext["conversation_init_option"] = json.dumps(init_option)
+            if flags["task_param"]:
+                ext["general_task_param"] = json.dumps(general_task_param)
+                ext["is_finish"] = "1"
+
+            log.info(
+                "Work-model payload: variant=%s model_item_key=%s effort=%s mode_id=%s "
+                "agent_mode=%s init_option=%s task_param=%s conv_mode=%s deep=%s",
+                variant, key, effort, mode_id, agent_mode_on,
+                bool(flags["init_option"]), bool(flags["task_param"]),
+                flags["conv_mode"], deep,
+            )
+
         # Build URL with query params (fetch hook will add a_bogus/msToken)
         query_params = self._build_query_params()
         query_string = "&".join(f"{k}={v}" for k, v in sorted(query_params.items()))
         url = f"/chat/completion?{query_string}"
 
-        request_id = f"req_{uuid.uuid4().hex[:16]}"
-        queue: asyncio.Queue = asyncio.Queue()
-        self._stream_queues[request_id] = queue
+        log.info("POST %s (conv=%s, deep_think=%s, prompt_chars=%d) [browser fetch]",
+                 url.split("?")[0], conversation_id or "new", use_deep_think, len(text))
 
-        log.info("POST %s (conv=%s, deep_think=%s) [browser fetch]",
-                 url.split("?")[0], conversation_id or "new", use_deep_think)
+        # 页内 fetch 偶发 "Failed to fetch"（网络抖动/代理拦截/页面刚刷新），
+        # 只要还没收到任何有效数据就自动重试，避免把一轮对话直接判死。
+        max_attempts = 3
+        ack_model_logged = False
+        for attempt in range(1, max_attempts + 1):
+            request_id = f"req_{uuid.uuid4().hex[:16]}"
+            queue: asyncio.Queue = asyncio.Queue()
+            self._stream_queues[request_id] = queue
+            eval_task = asyncio.create_task(
+                self._browser_fetch_stream(url, payload, request_id)
+            )
+            transient = None
+            got_data = False
+            try:
+                while True:
+                    chunk_json = await asyncio.wait_for(queue.get(), timeout=180)
+                    if chunk_json is None:
+                        break  # 流正常结束
+                    if chunk_json.startswith("__ERROR__:"):
+                        error_msg = chunk_json[10:]
+                        log.error("Browser fetch error (attempt %d/%d): %s",
+                                  attempt, max_attempts, error_msg[:200])
+                        transient = error_msg
+                        break
+                    if chunk_json.startswith("__HTTP_ERROR__:"):
+                        status = int(chunk_json[15:].split(":", 1)[0])
+                        body = chunk_json[15:].split(":", 1)[1] if ":" in chunk_json[15:] else ""
+                        log.error("API error %d: %s", status, body[:200])
+                        if status >= 500 and not got_data:
+                            transient = f"HTTP {status}: {body[:120]}"
+                            break
+                        yield {"error": True, "status": status, "body": body}
+                        return
+                    try:
+                        data = json.loads(chunk_json)
+                        if model_spec and not ack_model_logged and "model_item_key" in chunk_json:
+                            ack_model_logged = True
+                            idx = chunk_json.find("model_item_key")
+                            log.info(
+                                "Work-model ACK echo: %s",
+                                chunk_json[max(0, idx - 200):idx + 220],
+                            )
+                        got_data = True
+                        yield data
+                    except json.JSONDecodeError:
+                        continue
+                    # 收到数据后不再重试：避免向账号重复发请求
+                    max_attempts = attempt
+            except asyncio.TimeoutError:
+                log.error("Stream timeout (180s) for request %s", request_id)
+                if not got_data and attempt < max_attempts:
+                    transient = "Stream timeout"
+                else:
+                    yield {"error": True, "status": 0, "body": "Stream timeout"}
+                    return
+            finally:
+                self._stream_queues.pop(request_id, None)
+                if not eval_task.done():
+                    eval_task.cancel()
+                else:
+                    try:
+                        eval_task.result()
+                    except Exception:
+                        pass
 
-        # Launch browser fetch in background
-        eval_task = asyncio.create_task(
-            self._browser_fetch_stream(url, payload, request_id)
-        )
-
-        # Yield parsed SSE events from queue
-        try:
-            while True:
-                chunk_json = await asyncio.wait_for(queue.get(), timeout=180)
-                if chunk_json is None:
-                    # Stream complete
-                    break
-                if chunk_json.startswith("__ERROR__:"):
-                    error_msg = chunk_json[10:]
-                    log.error("Browser fetch error: %s", error_msg[:200])
-                    yield {"error": True, "status": 0, "body": error_msg}
-                    break
-                if chunk_json.startswith("__HTTP_ERROR__:"):
-                    status = int(chunk_json[15:].split(":", 1)[0])
-                    body = chunk_json[15:].split(":", 1)[1] if ":" in chunk_json[15:] else ""
-                    log.error("API error %d: %s", status, body[:200])
-                    yield {"error": True, "status": status, "body": body}
-                    break
-                # Parse SSE line
-                try:
-                    data = json.loads(chunk_json)
-                    yield data
-                except json.JSONDecodeError:
-                    continue
-        except asyncio.TimeoutError:
-            log.error("Stream timeout (180s) for request %s", request_id)
-            yield {"error": True, "status": 0, "body": "Stream timeout"}
-        finally:
-            self._stream_queues.pop(request_id, None)
-            if not eval_task.done():
-                eval_task.cancel()
-            else:
-                # Check for exceptions
-                try:
-                    eval_task.result()
-                except Exception:
-                    pass
+            if transient and attempt < max_attempts:
+                wait = 1.5 * attempt
+                log.warning("Retry %d after transient error: %s (wait %.1fs)",
+                            attempt, transient[:120], wait)
+                await asyncio.sleep(wait)
+                continue
+            if transient:
+                yield {"error": True, "status": 0, "body": transient}
+            return
 
     async def _browser_fetch_stream(
         self, url: str, payload: Dict[str, Any], request_id: str

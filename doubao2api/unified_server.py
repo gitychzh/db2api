@@ -62,12 +62,126 @@ CHAT_MODELS: Dict[str, int] = {
     "doubao-expert": 3,
 }
 
+# ── 豆包工作（Work）模型市场 ──────────────────────────────────
+# 这些模型不在普通对话里，只能在"工作"页签的模型选择器里选中，
+# 请求需要携带 option.model_config / agent_mode=1 / need_deep_think=10001。
+# key 为对外暴露的模型名，value 为浏览器端需要的模型选择参数。
+WORK_MODELS: Dict[str, Dict[str, Any]] = {
+    "deepseek-v4.1-flash": {
+        "model_item_key": "person-deepseek-v4-1-flash-261017",
+        "reasoning_effort": 5,      # 推理强度：高
+        "mode_id": "3",             # 工作模式
+        "memory_profile": "300k_230",
+        "total_window_size": "300000",
+        "owned_by": "doubao-work",
+        # mid3：保留模型选择所需的 10001/mode 通道与任务参数，但不置 agent_mode=1。
+        # 一旦 agent_mode=1，服务端会启用豆包自己的 agent 包装（自带工具/规划），
+        # 模型就不再遵守提示词注入的工具协议，并且会与系统指令冲突直接拒答；
+        # mid3 下选中的仍是同一个第三方模型，且会遵守注入的工具协议。
+        "variant": "mid3",
+        # 思考模式：need_deep_think=3 才会下发 10040 思考块（10001 在非 agent 通道没反应）
+        "need_deep_think": 3,
+        # 关掉 compact CHUNK_DELTA：它不带块类型，会把思考文本混进正文
+        "chunk_delta": False,
+    },
+}
+
+# 工作模型的公共默认参数：注册表 / 透传进来的新模型都以它为底。
+WORK_MODEL_DEFAULTS: Dict[str, Any] = {
+    "reasoning_effort": 5,
+    "mode_id": "3",
+    "memory_profile": "300k_230",
+    "total_window_size": "300000",
+    "owned_by": "doubao-work",
+    "variant": "mid3",
+    "need_deep_think": 3,
+    "chunk_delta": False,
+}
+
+# 可选的模型注册表：alias -> spec（也可以直接写 model_item_key 字符串）。
+# 文件不存在不影响启动；格式见 work_models.example.json。
+WORK_REGISTRY_PATH = os.path.join(os.path.dirname(__file__), "work_models.json")
+
+
+def _load_work_registry() -> Dict[str, Dict[str, Any]]:
+    try:
+        with open(WORK_REGISTRY_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:  # 坏文件不该拖垮启动
+        logging.getLogger("doubao2api").warning(
+            "work_models.json 读取失败（已忽略）: %s", exc
+        )
+        return {}
+
+    out: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for alias, val in raw.items():
+        if isinstance(val, str):
+            out[alias] = {"model_item_key": val}
+        elif isinstance(val, dict):
+            key = val.get("model_item_key") or val.get("id")
+            if key:
+                out[alias] = dict(val)
+    return out
+
+
+WORK_REGISTRY: Dict[str, Dict[str, Any]] = _load_work_registry()
+
+
+def _passthrough_enabled() -> bool:
+    """未知模型名是否原样当作 model_item_key 透传给豆包（默认开启）。"""
+    return os.getenv("DOUBAO_WORK_PASSTHROUGH", "1").lower() not in ("0", "false", "no")
+
+
+def resolve_work_spec(name: str) -> Optional[Dict[str, Any]]:
+    """把对外模型名解析成浏览器端模型选择参数。
+
+    优先级：内置 WORK_MODELS → work_models.json 注册表 → 原样透传。
+    透传支持三种写法：
+      person-xxx   直接就是豆包市场的 model_item_key
+      work:xxx     去掉 "work:" 前缀后作为 model_item_key
+      其它任意 id  同样原样作为 model_item_key（可用 DOUBAO_WORK_PASSTHROUGH=0 关闭）
+    """
+    if name in WORK_MODELS:
+        return dict(WORK_MODELS[name])
+    if name in WORK_REGISTRY:
+        spec = dict(WORK_MODEL_DEFAULTS)
+        spec.update(WORK_REGISTRY[name])
+        return spec
+    if not _passthrough_enabled():
+        return None
+    key = name[5:] if name.startswith("work:") else name
+    if not key.strip():
+        return None
+    spec = dict(WORK_MODEL_DEFAULTS)
+    spec["model_item_key"] = key
+    spec["passthrough"] = True
+    return spec
+
+
+def work_model_ids() -> List[str]:
+    """对外暴露的工作模型 id（内置 + 注册表 + 环境变量补充）。"""
+    ids = list(WORK_MODELS.keys()) + list(WORK_REGISTRY.keys())
+    for item in os.getenv("DOUBAO_EXTRA_WORK_IDS", "").split(","):
+        item = item.strip()
+        if item and item not in ids:
+            ids.append(item)
+    return ids
+
 # Qianwen models (routed to QianwenClient)
 QIANWEN_MODEL_NAMES = set(QIANWEN_MODELS.keys())
 
 ALL_MODELS = [
     {"id": m, "object": "model", "owned_by": "doubao", "created": 0}
     for m in CHAT_MODELS
+] + [
+    {"id": m, "object": "model",
+     "owned_by": WORK_MODELS.get(m, WORK_REGISTRY.get(m, {})).get("owned_by", "doubao-work"),
+     "created": 0}
+    for m in work_model_ids()
 ] + [
     {"id": m, "object": "model", "owned_by": "qianwen", "created": 0}
     for m in QIANWEN_MODELS
@@ -508,6 +622,83 @@ def create_app(
         _check_auth(request)
         return {"object": "list", "data": ALL_MODELS}
 
+    # ── 诊断端点：抓一次原始 SSE 事件，用于对齐第三方模型的协议差异 ──
+    @app.post("/debug/raw_chat")
+    async def debug_raw_chat(request: Request):
+        _check_auth(request)
+        try:
+            data = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid json")
+        text = data.get("text") or "帮我看看当前目录有哪些文件"
+        model = data.get("model", "deepseek-v4.1-flash")
+        base = resolve_work_spec(model)
+        if not base:
+            raise HTTPException(status_code=400, detail=f"unknown work model: {model}")
+        spec = dict(base)
+        spec["variant"] = data.get("variant", "agent")
+        for k in ("agent_mode_flag", "init_option_flag", "task_param_flag",
+                  "conversation_mode", "need_deep_think"):
+            if data.get(k) is not None:
+                spec[k] = data[k]
+        if data.get("chunk_delta") is not None:
+            spec["chunk_delta"] = bool(data["chunk_delta"])
+        tools = data.get("tools")
+        raw_prompt = data.get("raw_prompt")
+        if raw_prompt:
+            prompt = raw_prompt
+        elif tools:
+            prompt = convert_messages_with_tools(
+                [{"role": "user", "content": text}], tools
+            )
+        else:
+            prompt = text
+        client = _get_client()
+        types: dict = {}
+        block_types: dict = {}
+        text_parts: list = []
+        others: list = []
+        model_echo = ""
+
+        def _scan_blocks(obj):
+            if isinstance(obj, dict):
+                bt = obj.get("block_type")
+                if isinstance(bt, int):
+                    key = str(bt)
+                    block_types[key] = block_types.get(key, 0) + 1
+                for v in obj.values():
+                    _scan_blocks(v)
+            elif isinstance(obj, list):
+                for v in obj:
+                    _scan_blocks(v)
+
+        async for ev in client.chat_completion(
+            prompt, use_deep_think=1, model_spec=spec
+        ):
+            et = ev.get("_event", "")
+            types[et] = types.get(et, 0) + 1
+            _scan_blocks(ev)
+            if not model_echo:
+                blob = json.dumps(ev, ensure_ascii=False)
+                if "model_item_key" in blob:
+                    idx = blob.find("model_item_key")
+                    model_echo = blob[max(0, idx - 120): idx + 160]
+            if et == "CHUNK_DELTA" and isinstance(ev.get("text"), str):
+                text_parts.append(ev["text"])
+            elif ev.get("error"):
+                others.append({"error": ev.get("status"), "body": str(ev.get("body"))[:300]})
+                break
+            elif len(others) < 40:
+                others.append(ev)
+        return {
+            "variant": spec["variant"],
+            "event_types": types,
+            "block_types": block_types,
+            "answer": "".join(text_parts),
+            "model_echo": model_echo,
+            "others": others,
+        }
+
     @app.post("/v1/chat/completions")
     async def chat_completions(body: ChatCompletionRequest, request: Request):
         _check_auth(request)
@@ -518,7 +709,20 @@ def create_app(
 
         # ── Tool calling mode ──
         has_tools = bool(body.tools)
-        if has_tools:
+        work_spec = resolve_work_spec(body.model)
+        if work_spec is not None:
+            # 工作模式模型市场：模型选择由 model_spec 透传给浏览器端请求
+            model_name = body.model
+            use_deep_think = 1  # 占位值，实际由 model_spec 覆盖为 10001
+            file_refs = []
+            messages_raw = [m.model_dump(exclude_none=True) for m in body.messages]
+            if has_tools:
+                prompt = convert_messages_with_tools(messages_raw, body.tools)
+            else:
+                prompt, file_refs = _extract_prompt_and_file_refs(body.messages)
+                if not prompt:
+                    raise HTTPException(status_code=400, detail="No text content")
+        elif has_tools:
             # Use expert model for tool calling, with auto-fallback to think if degraded
             requested_deep_think = CHAT_MODELS["doubao-expert"]
             use_deep_think, model_name = _expert_tracker.get_effective_mode(requested_deep_think)
@@ -528,7 +732,11 @@ def create_app(
         else:
             use_deep_think = CHAT_MODELS.get(body.model)
             if use_deep_think is None:
-                all_models = list(CHAT_MODELS.keys()) + list(QIANWEN_MODEL_NAMES)
+                all_models = (
+                    list(CHAT_MODELS.keys())
+                    + list(WORK_MODELS.keys())
+                    + list(QIANWEN_MODEL_NAMES)
+                )
                 raise HTTPException(
                     status_code=400,
                     detail=f"Unknown model '{body.model}'. Available: {', '.join(all_models)}",
@@ -554,7 +762,8 @@ def create_app(
                 _stream_chat(client, prompt, use_deep_think, request_id, model_name,
                              conversation_id=body.conversation_id, bot_id=body.bot_id,
                              has_tools=has_tools,
-                             messages_for_counting=body.messages),
+                             messages_for_counting=body.messages,
+                             model_spec=work_spec),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -566,6 +775,7 @@ def create_app(
                 message = await _collect_chat_response(
                     client, prompt, use_deep_think,
                     conversation_id=body.conversation_id, bot_id=body.bot_id,
+                    model_spec=work_spec,
                 )
                 # Report to expert tracker (detect silent downgrade)
                 had_reasoning = bool(message.get("reasoning_content"))
@@ -598,6 +808,7 @@ def create_app(
                 message = await _collect_chat_response(
                     client, prompt, use_deep_think,
                     conversation_id=body.conversation_id, bot_id=body.bot_id,
+                    model_spec=work_spec,
                 )
                 finish_reason = "stop"
         except RuntimeError as exc:
@@ -1169,6 +1380,7 @@ def create_app(
         *,
         conversation_id: Optional[str] = None,
         bot_id: Optional[str] = None,
+        model_spec: Optional[Dict[str, Any]] = None,
     ) -> dict:
         """Collect full chat response with thinking separation.
 
@@ -1194,6 +1406,7 @@ def create_app(
             prompt, use_deep_think=use_deep_think,
             conversation_id=conversation_id or None,
             bot_id=bot_id or None,
+            model_spec=model_spec,
         ):
             if event.get("error"):
                 raise RuntimeError(
@@ -1282,6 +1495,7 @@ def create_app(
         bot_id: Optional[str] = None,
         has_tools: bool = False,
         messages_for_counting: Optional[list] = None,
+        model_spec: Optional[Dict[str, Any]] = None,
     ):
         """Generate real-time SSE stream in OpenAI format via httpx streaming.
 
@@ -1331,12 +1545,18 @@ def create_app(
                 prompt, use_deep_think=use_deep_think,
                 conversation_id=conversation_id or None,
                 bot_id=bot_id or None,
+                model_spec=model_spec,
             ):
                 if event.get("error"):
-                    chunk = _make_chunk(
-                        {"content": f"[Error {event.get('status')}]"}
-                    )
-                    yield f"data: {json.dumps(chunk)}\n\n"
+                    status = event.get("status")
+                    body = str(event.get("body") or "")[:160]
+                    note = f"[Error {status}]" + (f" {body}" if body else "")
+                    chunk = _make_chunk({"content": note})
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    # 必须给出终结 finish_reason：否则 OpenAI 兼容客户端会判定
+                    # "stream ended without finish_reason" 并把整轮当成无效输出。
+                    final_chunk = _make_chunk({}, finish_reason="stop")
+                    yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
 
@@ -1357,6 +1577,8 @@ def create_app(
                         {"content": f"[Error code={code}: {msg}]"}
                     )
                     yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    final_chunk = _make_chunk({}, finish_reason="stop")
+                    yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
 

@@ -1,0 +1,17 @@
+{
+  "_comment": "把豆包「工作」页签模型市场里的模型填进来：别名 -> model_item_key。复制本文件为 work_models.json（同目录）即生效，重启网关后出现在 /v1/models。alias 就是你在 opencode 里填的 model id。",
+  "glm-5.3-flash": {
+    "model_item_key": "person-glm-5-3-flash-XXXXXXXX",
+    "reasoning_effort": 5,
+    "mode_id": "3",
+    "memory_profile": "300k_230",
+    "total_window_size": "300000"
+  },
+  "qwen4-max": {
+    "model_item_key": "person-qwen4-max-XXXXXXXX"
+  },
+  "kimi-k3": {
+    "model_item_key": "person-kimi-k3-XXXXXXXX"
+  },
+  "deepseek-v4.1-flash": "person-deepseek-v4-1-flash-261017"
+}
